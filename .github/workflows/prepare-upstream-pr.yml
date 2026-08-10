@@ -1,0 +1,123 @@
+name: Prepare upstream PR branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      feature_branch:
+        description: "Fork branch to rebase, test, squash, and re-author"
+        required: true
+        type: string
+      upstream_base:
+        description: "Upstream base branch"
+        required: true
+        default: "dev"
+        type: string
+      commit_message:
+        description: "Final squashed commit message"
+        required: true
+        type: string
+      test_profile:
+        description: "Validation to run before rewriting the branch"
+        required: true
+        default: "gateway-guardrails"
+        type: choice
+        options:
+          - gateway-guardrails
+          - gateway-all
+          - none
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.feature_branch }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          FEATURE_BRANCH: ${{ inputs.feature_branch }}
+          UPSTREAM_BASE: ${{ inputs.upstream_base }}
+        run: |
+          set -euo pipefail
+          git check-ref-format --branch "$FEATURE_BRANCH" >/dev/null
+          git check-ref-format --branch "$UPSTREAM_BASE" >/dev/null
+
+      - name: Rebase onto upstream
+        shell: bash
+        env:
+          FEATURE_BRANCH: ${{ inputs.feature_branch }}
+          UPSTREAM_BASE: ${{ inputs.upstream_base }}
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/future-agi/future-agi.git
+          git fetch --prune upstream "$UPSTREAM_BASE"
+          git fetch --prune origin "$FEATURE_BRANCH"
+          git checkout -B "$FEATURE_BRANCH" "origin/$FEATURE_BRANCH"
+          git rebase "upstream/$UPSTREAM_BASE"
+
+      - name: Run focused gateway tests
+        if: inputs.test_profile == 'gateway-guardrails'
+        working-directory: agentcc-gateway
+        run: go test ./internal/guardrails ./internal/pipeline
+
+      - name: Run full gateway tests
+        if: inputs.test_profile == 'gateway-all'
+        working-directory: agentcc-gateway
+        run: go test ./...
+
+      - name: Squash and re-author as workflow runner
+        shell: bash
+        env:
+          FEATURE_BRANCH: ${{ inputs.feature_branch }}
+          UPSTREAM_BASE: ${{ inputs.upstream_base }}
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+          AUTHOR_LOGIN: ${{ github.actor }}
+          AUTHOR_ID: ${{ github.actor_id }}
+        run: |
+          set -euo pipefail
+          git reset --soft "upstream/$UPSTREAM_BASE"
+
+          if git diff --cached --quiet; then
+            echo "No contribution changes remain relative to upstream/$UPSTREAM_BASE"
+            exit 1
+          fi
+
+          git config user.name "$AUTHOR_LOGIN"
+          git config user.email "${AUTHOR_ID}+${AUTHOR_LOGIN}@users.noreply.github.com"
+          git commit -m "$COMMIT_MESSAGE"
+
+      - name: Push cleaned branch
+        shell: bash
+        env:
+          FEATURE_BRANCH: ${{ inputs.feature_branch }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "HEAD:$FEATURE_BRANCH"
+
+      - name: Summary
+        shell: bash
+        env:
+          FEATURE_BRANCH: ${{ inputs.feature_branch }}
+          UPSTREAM_BASE: ${{ inputs.upstream_base }}
+        run: |
+          {
+            echo "## Branch prepared for upstream PR"
+            echo
+            echo "- Branch: \`$FEATURE_BRANCH\`"
+            echo "- Upstream base: \`$UPSTREAM_BASE\`"
+            echo "- Author: \`${GITHUB_ACTOR}\`"
+            echo "- Tests: \`${{ inputs.test_profile }}\`"
+            echo
+            echo "The branch is rebased, squashed, re-authored, and pushed."
+          } >> "$GITHUB_STEP_SUMMARY"
